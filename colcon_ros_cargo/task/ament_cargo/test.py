@@ -3,7 +3,7 @@
 
 import os
 
-from colcon_cargo.task.cargo import CARGO_EXECUTABLE
+from . import CARGO_EXECUTABLE
 from colcon_core.event.test import TestFailure
 from colcon_core.logging import colcon_logger
 from colcon_core.plugin_system import satisfies_version

@@ -6,9 +6,10 @@ import shutil
 
 from . import CARGO_EXECUTABLE
 from colcon_core.logging import colcon_logger
+from colcon_core.environment import create_environment_scripts
 from colcon_core.plugin_system import satisfies_version
-from colcon_core.shell import create_environment_hook
-from colcon_core.task import TaskExtensionPoint
+from colcon_core.shell import create_environment_hook, get_command_environment
+from colcon_core.task import TaskExtensionPoint, run
 import toml
 
 

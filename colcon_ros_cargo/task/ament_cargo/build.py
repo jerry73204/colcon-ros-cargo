@@ -22,16 +22,15 @@ package_paths = None
 
 
 class AmentCargoBuildTask(CargoBuildTask):
-    """A build task for packages with Cargo.toml + package.xml.
+    """A build task for packages with Cargo.toml + package.xml using cargo-ros2.
 
-    The primary problem that needs to be solved is that dependencies on other
-    packages in the same workspace are expressed by just a name in colcon, but
-    by a full path in Cargo.
+    cargo-ros2 handles ROS 2 binding generation and installation automatically.
+    It discovers ROS dependencies via ament_index, generates Rust bindings,
+    caches results, and installs to ament-compatible locations.
 
-    That means, when building a Cargo package, all the packages it depends on
-    need to be resolved to full paths, and those need to be written into the
-    Cargo.toml, or alternatively into a [patch] section of a .cargo/config.toml
-    file. Here the latter approach is used.
+    Dependencies between Rust packages in the workspace are resolved via
+    [patch] sections in .cargo/config.toml, which cargo-ros2 manages
+    automatically.
     """
 
     def __init__(self):  # noqa: D107
@@ -48,13 +47,13 @@ class AmentCargoBuildTask(CargoBuildTask):
             '.cargo/config.toml for subsequent builds with cargo.')
 
     def _prepare(self, env, additional_hooks):
-        ament_build = 'cargo ament-build --help'.split()
-        if subprocess.run(ament_build, capture_output=True).returncode != 0:
+        # Check for cargo-ros2
+        cargo_ros2_check = 'cargo ros2 --version'.split()
+        if subprocess.run(cargo_ros2_check, capture_output=True).returncode != 0:
             logger.error(
-                '\n\nament_cargo package found but cargo ament-build was '
-                'not detected.'
+                '\n\nament_cargo package found but cargo-ros2 was not detected.'
                 '\n\nPlease install it by running:'
-                '\n $ cargo install cargo-ament-build\n')
+                '\n $ cargo install cargo-ros2\n')
             return 1
 
         args = self.context.args
@@ -91,7 +90,7 @@ class AmentCargoBuildTask(CargoBuildTask):
         src_dir = Path(self.context.pkg.path).resolve()
         manifest_path = str(src_dir / 'Cargo.toml')
         return [
-            CARGO_EXECUTABLE, 'ament-build',
+            CARGO_EXECUTABLE, 'ros2', 'ament-build',
             '--install-base', args.install_base,
             '--',
             '--manifest-path', manifest_path,
@@ -99,7 +98,7 @@ class AmentCargoBuildTask(CargoBuildTask):
             '--quiet'
         ] + cargo_args
 
-    # Installation is done by cargo ament-build
+    # Installation is done by cargo ros2 ament-build
     def _install_cmd(self, cargo_args):  # noqa: D102
         pass
 

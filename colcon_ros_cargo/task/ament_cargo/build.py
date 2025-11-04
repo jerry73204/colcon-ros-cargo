@@ -4,33 +4,24 @@ import os
 from pathlib import Path
 import subprocess
 
-from colcon_cargo.task.cargo import CARGO_EXECUTABLE
-from colcon_cargo.task.cargo.build import CargoBuildTask
 from colcon_core.logging import colcon_logger
 from colcon_core.plugin_system import satisfies_version
 from colcon_core.shell import create_environment_hook
-from colcon_core.task import TaskExtensionPoint
-import toml
+from colcon_core.task import TaskExtensionPoint, run
 
 
 logger = colcon_logger.getChild(__name__)
 
-# Some logic needs to be executed once per run.
-# There are no colcon hooks for this, so it is shoehorned into the build step
-# with a global.
-package_paths = None
 
-
-class AmentCargoBuildTask(CargoBuildTask):
+class AmentCargoBuildTask(TaskExtensionPoint):
     """A build task for packages with Cargo.toml + package.xml using cargo-ros2.
 
-    cargo-ros2 handles ROS 2 binding generation and installation automatically.
-    It discovers ROS dependencies via ament_index, generates Rust bindings,
-    caches results, and installs to ament-compatible locations.
+    cargo-ros2 handles ROS 2 binding generation, .cargo/config.toml patching,
+    and installation automatically. This task is a simple orchestration layer
+    that invokes cargo-ros2.
 
-    Dependencies between Rust packages in the workspace are resolved via
-    [patch] sections in .cargo/config.toml, which cargo-ros2 manages
-    automatically.
+    All dependency resolution and config.toml management is delegated to
+    cargo-ros2 to avoid race conditions.
     """
 
     def __init__(self):  # noqa: D107
@@ -46,9 +37,35 @@ class AmentCargoBuildTask(CargoBuildTask):
             'prefixes. This option is useful for setting up a '
             '.cargo/config.toml for subsequent builds with cargo.')
 
-    def _prepare(self, env, additional_hooks):
+    async def build(self, *, additional_hooks=None):  # noqa: D102
+        """Build the Rust ROS 2 package using cargo-ros2."""
+        additional_hooks = [] if additional_hooks is None else additional_hooks
+
+        # Prepare: check for cargo-ros2 and create environment hooks
+        rc = await self._prepare(additional_hooks)
+        if rc:
+            return rc
+
+        # Build and install: delegated to cargo-ros2
+        args = self.context.args
+        cmd = self._build_cmd(args.cargo_args if hasattr(args, 'cargo_args') else [])
+
+        # Add --lookup-in-workspace flag if requested
+        if args.lookup_in_workspace:
+            cmd.append('--lookup-in-workspace')
+
+        # Execute the build command
+        return await run(
+            self.context,
+            cmd,
+            cwd=self.context.pkg.path,
+            env=None
+        )
+
+    async def _prepare(self, additional_hooks):
+        """Check prerequisites and create environment hooks."""
         # Check for cargo-ros2
-        cargo_ros2_check = 'cargo ros2 --version'.split()
+        cargo_ros2_check = 'cargo ros2 --help'.split()
         if subprocess.run(cargo_ros2_check, capture_output=True).returncode != 0:
             logger.error(
                 '\n\nament_cargo package found but cargo-ros2 was not detected.'
@@ -56,123 +73,38 @@ class AmentCargoBuildTask(CargoBuildTask):
                 '\n $ cargo install cargo-ros2\n')
             return 1
 
+        # Create environment hook for AMENT_PREFIX_PATH
         args = self.context.args
-
-        global package_paths
-        if package_paths is None:
-            if args.lookup_in_workspace:
-                package_paths = find_workspace_cargo_packages(args.build_base, args.install_base)  # noqa: E501
-            else:
-                package_paths = {}
-
-        # Scan the install dirs, aka prefixes. Note that only those prefixes
-        # will be scanned that are a dependency of the current package.
-        new_package_paths = find_installed_cargo_packages(env)
-        # The new_package_paths cover only the dependencies of the
-        # current package, but .cargo/config.toml should contain all Rust
-        # packages seen during the build process (so that you can afterwards
-        # use cargo for every package in the workspace).
-        # Hence, the installed package paths need to be accumulated.
-        new_package_paths.update(package_paths)
-        package_paths = new_package_paths
-        write_cargo_config_toml(package_paths)
-
-        additional_hooks += create_environment_hook(
+        additional_hooks.extend(create_environment_hook(
             'ament_prefix_path',
-            Path(self.context.args.install_base),
+            Path(args.install_base),
             self.context.pkg.name,
             'AMENT_PREFIX_PATH',
             '',
-            mode='prepend')
+            mode='prepend'))
+
+        return 0
 
     def _build_cmd(self, cargo_args):
+        """Build the cargo ros2 ament-build command."""
         args = self.context.args
-        src_dir = Path(self.context.pkg.path).resolve()
-        manifest_path = str(src_dir / 'Cargo.toml')
-        return [
-            CARGO_EXECUTABLE, 'ros2', 'ament-build',
+        cmd = [
+            'cargo', 'ros2', 'ament-build',
             '--install-base', args.install_base,
-            '--',
-            '--manifest-path', manifest_path,
-            '--target-dir', args.build_base,
-            '--quiet'
-        ] + cargo_args
+        ]
 
-    # Installation is done by cargo ros2 ament-build
-    def _install_cmd(self, cargo_args):  # noqa: D102
-        pass
+        # Handle None cargo_args
+        if cargo_args is None:
+            cargo_args = []
 
+        # Add --release if present in cargo_args
+        if '--release' in cargo_args:
+            cmd.append('--release')
 
-def write_cargo_config_toml(package_paths):
-    """Write the resolved package paths to config.toml.
+        # Pass through all additional cargo args
+        # (they will be forwarded to cargo build after bindings are generated)
+        non_release_args = [arg for arg in cargo_args if arg != '--release']
+        if non_release_args:
+            cmd.extend(['--'] + non_release_args)
 
-    :param package_paths: A mapping of package names to paths
-    """
-    patches = {pkg: {'path': str(path)} for pkg, path in package_paths.items()}
-    content = {'patch': {'crates-io': patches}}
-    config_dir = Path.cwd() / '.cargo'
-    config_dir.mkdir(exist_ok=True)
-    cargo_config_toml_out = config_dir / 'config.toml'
-    with cargo_config_toml_out.open('w') as toml_file:
-        toml.dump(content, toml_file)
-
-
-def find_installed_cargo_packages(env):
-    """Find out which prefix contains each of the dependencies.
-
-    :param env: Environment dict for this package
-    :returns: A mapping of package names to paths
-    :rtype dict(str, Path)
-    """
-    prefix_for_package = {}
-    ament_prefix_path_var = env.get('AMENT_PREFIX_PATH')
-    if ament_prefix_path_var is None:
-        logger.warning('AMENT_PREFIX_PATH is empty. '
-                       'You probably intended to source a ROS installation.')
-        prefixes = []
-    else:
-        prefixes = ament_prefix_path_var.split(os.pathsep)
-    for prefix in prefixes:
-        prefix = Path(prefix)
-        packages_dir = prefix / 'share' / 'ament_index' / 'resource_index' \
-            / 'rust_packages'
-        if packages_dir.exists():
-            packages = {path.name for path in packages_dir.iterdir()}
-        else:
-            packages = set()
-        for pkg in packages:
-            prefix_for_package[pkg] = prefix
-    return {pkg: str(prefix / 'share' / pkg / 'rust')
-            for pkg, prefix in prefix_for_package.items()}
-
-
-def find_workspace_cargo_packages(build_base, install_base):
-    """Find Cargo packages in the workspace/current working directory.
-
-    :param install_base: The install base of the current build
-    :returns: A mapping of package names to paths
-    :rtype dict(str, Path)
-    """
-    path_for_package = {}
-    for (dirpath, dirnames, filenames) in os.walk(Path.cwd(), topdown=True):
-        # Users will often build the workspace several times into differently
-        # named install directories, and we don't know their names. So if we
-        # just scan through the current working directory, we'll probably find
-        # Rust packages in those install directories. That's not what we want,
-        # so install directories (identified by a setup.sh file) should be
-        # skipped.
-        if dirpath == install_base or (Path(dirpath) / 'setup.sh').exists():
-            # Do not descend into this directory
-            dirnames[:] = []
-        elif dirpath == build_base or (Path(dirpath) / 'COLCON_IGNORE').exists():  # noqa: E501
-            # In particular, build dirs have a COLCON_IGNORE
-            # Do not descend into this directory
-            dirnames[:] = []
-        elif 'Cargo.toml' in filenames:
-            try:
-                cargo_toml = toml.load(Path(dirpath) / 'Cargo.toml')
-                name = cargo_toml['package']['name']
-                path_for_package[name] = dirpath
-            except toml.decoder.TomlDecodeError:
-                pass
-    return path_for_package
+        return cmd

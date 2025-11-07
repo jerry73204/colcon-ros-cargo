@@ -55,12 +55,15 @@ class AmentCargoBuildTask(TaskExtensionPoint):
             cmd.append('--lookup-in-workspace')
 
         # Execute the build command
-        return await run(
+        result = await run(
             self.context,
             cmd,
             cwd=self.context.pkg.path,
             env=None
         )
+
+        # Return the exit code (colcon expects an integer, not CompletedProcess)
+        return result.returncode if result else 0
 
     async def _prepare(self, additional_hooks):
         """Check prerequisites and create environment hooks."""
